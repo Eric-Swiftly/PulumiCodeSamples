@@ -8,13 +8,43 @@ from pulumi_azure_native.storage import list_storage_account_keys_output
 from azure.storage.blob import BlobServiceClient, AccessPolicy, ContainerSasPermissions, ContainerClient, generate_container_sas
 
 
-@dataclass
-class ContainerAccessPolicyArgs:
-    """Arguments which will be passed to the ContainerAccessPolicyProvider"""
-    storage_account: Input[str]
-    resource_group: Input[str]
-    container_name: Input[str]
-    policies: Input[dict]
+def get_container_client(connection_string: str, container_name: str) -> ContainerClient:
+    """Get a ContainerClient to be used for other calls"""
+    try:
+        service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = service_client.get_container_client(container_name)
+    except Exception as error:
+        raise Exception(f"Error getting container client for {container_name}.\nError: {error}") from error
+    return container_client
+
+
+def set_access_policy(container_client: ContainerClient, verb: str, container_name: str, public_access: str, identifiers: dict = None) -> None:
+    """Set Access Policies.  This could be create, update, or delete"""
+    if identifiers is None:
+        identifiers = {}
+    if public_access == "off":
+        public_access = None
+    try:
+        container_client.set_container_access_policy(signed_identifiers=identifiers, public_access=public_access)
+    except Exception as error:
+        raise Exception(f"Error {verb} Access Policy for {container_name}.\nError: {error}") from error
+
+
+def generate_tokens(policies: dict, container_client: ContainerClient) -> dict:
+    """Generate SAS tokens based upon the policy"""
+    tokens = {}
+    for policy in policies.keys():
+        try:
+            sas_token = generate_container_sas(container_client.account_name,
+                                               container_client.container_name,
+                                               container_client.credential.account_key,
+                                               policy_id=policy,
+                                               protocol="https")
+            tokens[policy] = sas_token
+        except Exception as error:
+            raise Exception(f"Error generating SAS token for policy {policy} in container {container_client.container_name}.\nError: {error}")\
+                from error
+    return tokens
 
 
 class ContainerAccessPolicyProvider(ResourceProvider):
@@ -32,6 +62,8 @@ class ContainerAccessPolicyProvider(ResourceProvider):
         failures = []
         if not isinstance(news.get("container_name"), str):
             failures.append(CheckFailure("container_name", "Must be a string"))
+        if news.get("public_access").lower() not in ["off", "container", "blob"]:
+            failures.append(CheckFailure("public_access", "Must be one of 'blob', 'container', 'off'"))
         policies = news.get("policies")
         if not isinstance(policies, dict):
             failures.append(CheckFailure("policies", "Must be a dictionary[name, permission]"))
@@ -54,9 +86,9 @@ class ContainerAccessPolicyProvider(ResourceProvider):
         policies = props["policies"]
         for name, permission in policies.items():
             identifiers[name] = (self.read_access_policy if permission == "read" else self.write_access_policy)
-        container_client = self.get_container_client(props["connection_string"], container_name)
-        self.set_access_policy(container_client, "creating", container_name, identifiers)
-        props["tokens"] = self.generate_tokens(policies, container_client)
+        container_client = get_container_client(props["connection_string"], container_name)
+        set_access_policy(container_client, "creating", container_name, props["public_access"], identifiers)
+        props["tokens"] = generate_tokens(policies, container_client)
         return CreateResult(id_=container_name, outs=props)
 
     def diff(self, _id: str, _olds: dict, _news: dict) -> DiffResult:
@@ -71,26 +103,30 @@ class ContainerAccessPolicyProvider(ResourceProvider):
         change = bool(len(replaces) != 0)
 
         if not change:
+            container_client = get_container_client(_news["connection_string"], _id)
             try:
-                service_client = BlobServiceClient.from_connection_string(_news["connection_string"])
-                container_client = service_client.get_container_client(_id)
                 azure_policy = container_client.get_container_access_policy()
             except Exception as error:
                 raise Exception(f"Error getting existing Access Policy for {_id}.\nError: {error}") from error
-            new_policies = _news["policies"]
-            azure_policies = azure_policy["signed_identifiers"]
-            if len(azure_policies) == 0:
-                change = True
-            for identifier in azure_policies:
-                permission = new_policies.get(identifier.id)
-                if permission is None or len(azure_policies) != len(new_policies):
+            azure_public_access = azure_policy["public_access"]
+            if azure_public_access is None:
+                azure_public_access = "off"
+            change = bool(_news["public_access"] != azure_public_access)
+            if not change:
+                new_policies = _news["policies"]
+                azure_policies = azure_policy["signed_identifiers"]
+                if len(azure_policies) == 0:
                     change = True
-                    break
-                match = ("rl" if permission == "read" else "racwdl")
-                if match != identifier.access_policy.permission or identifier.access_policy.start != "2022-01-01T00:00:00.0000000Z"\
-                or identifier.access_policy.expiry != "2100-01-01T00:00:00.0000000Z":
-                    change = True
-                    break
+                for identifier in azure_policies:
+                    permission = new_policies.get(identifier.id)
+                    if permission is None or len(azure_policies) != len(new_policies):
+                        change = True
+                        break
+                    match = ("rl" if permission == "read" else "racwdl")
+                    if match != identifier.access_policy.permission or identifier.access_policy.start != "2022-01-01T00:00:00.0000000Z"\
+                    or identifier.access_policy.expiry != "2100-01-01T00:00:00.0000000Z":
+                        change = True
+                        break
         return DiffResult(changes=change, replaces=replaces, stables=[], delete_before_replace=True)
 
     def update(self, _id: str, _olds: dict, _news: dict) -> UpdateResult:
@@ -99,56 +135,14 @@ class ContainerAccessPolicyProvider(ResourceProvider):
         policies = _news["policies"]
         for name, permission in policies.items():
             identifiers[name] = (self.read_access_policy if permission == "read" else self.write_access_policy)
-        container_client = self.get_container_client(_news["connection_string"], _id)
-        self.set_access_policy(container_client, "updating", _id, identifiers)
-        _news["tokens"] = self.generate_tokens(policies, container_client)
+        container_client = get_container_client(_news["connection_string"], _id)
+        set_access_policy(container_client, "updating", _id, _news["public_access"], identifiers)
+        _news["tokens"] = generate_tokens(policies, container_client)
         return UpdateResult(_news)
 
     def delete(self, _id: str, _props: dict) -> None:
-        container_client = self.get_container_client(_props["connection_string"], _id)
-        self.set_access_policy(container_client, "deleting", _id)
-
-    @staticmethod
-    def get_container_client(connection_string: str, container_name: str) -> ContainerClient:
-        """Get a ContainerClient to be used for other calls"""
-        try:
-            service_client = BlobServiceClient.from_connection_string(connection_string)
-            container_client = service_client.get_container_client(container_name)
-        except Exception as error:
-            raise Exception(f"Error getting container client for {container_name}.\nError: {error}") from error
-        return container_client
-
-    @staticmethod
-    def set_access_policy(container_client: ContainerClient, verb: str, container_name: str, identifiers: dict = None) -> None:
-        """Set Access Policies.  This could be create, update, or delete"""
-        if identifiers is None:
-            identifiers = {}
-        try:
-            container_client.set_container_access_policy(signed_identifiers=identifiers)
-        except Exception as error:
-            raise Exception(f"Error {verb} Access Policy for {container_name}.\nError: {error}") from error
-
-    @staticmethod
-    def generate_tokens(policies: dict, container_client: ContainerClient) -> dict:
-        """Generate SAS tokens based upon the policy"""
-        tokens = {}
-        for policy in policies.keys():
-            try:
-                sas_token = generate_container_sas(container_client.account_name,
-                                                   container_client.container_name,
-                                                   container_client.credential.account_key,
-                                                   policy_id=policy,
-                                                   protocol="https")
-                tokens[policy] = sas_token
-            except Exception as error:
-                raise Exception(f"Error generating SAS token for policy {policy} in container {container_client.container_name}.\nError: {error}")\
-                    from error
-        return tokens
-
-
-def generate_connection_string(account_name: str, account_key: str):
-    """Generate a connection string used to connect to a Storage Account"""
-    return f"DefaultEndpointsProtocol=https;AccountName={account_name};AccountKey={account_key};EndpointSuffix=core.windows.net"
+        container_client = get_container_client(_props["connection_string"], _id)
+        set_access_policy(container_client, "deleting", _id, _props["public_access"])
 
 
 def get_account_key(account_name: str, resource_group_name: str) -> Output[str]:
@@ -161,8 +155,19 @@ def get_account_key(account_name: str, resource_group_name: str) -> Output[str]:
 
 
 def get_connection_string(account_name: str, resource_group_name: str) -> Output[str]:
-    """Generate a connection string used to connect to a Storage Account from Outputs"""
-    return Output.all(account_name, get_account_key(account_name, resource_group_name)).apply(lambda it: generate_connection_string(*it))
+    """Generate a connection string used to connect to a Storage Account"""
+    return Output.concat("DefaultEndpointsProtocol=https;AccountName=", account_name, ";AccountKey=", \
+         get_account_key(account_name, resource_group_name), ";EndpointSuffix=core.windows.net")
+
+
+@dataclass
+class ContainerAccessPolicyArgs:
+    """Arguments which will be passed to the ContainerAccessPolicyProvider"""
+    storage_account: Input[str]
+    resource_group: Input[str]
+    container_name: Input[str]
+    policies: Input[dict]
+    public_access: Input[str] = "off"
 
 
 class ContainerAccessPolicies(Resource):
